@@ -15,7 +15,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.myscript.panicbutton",
-      "buildNumber": "1",
+      "buildNumber": "2",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Find your PC panic server on local Wi-Fi.",
         "NSAppTransportSecurity": {
