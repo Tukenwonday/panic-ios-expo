@@ -1,0 +1,89 @@
+name: iOS unsigned IPA (SideStore)
+
+# Free Windows-only path: builds an UNSIGNED .ipa on a cloud Mac.
+# SideStore resigns it on-device with your free Apple ID (7-day, 3-app limit).
+# Push THIS FOLDER (panic-ios) as the repo root, then Run workflow -> download artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          set -e
+          ls -d /Applications/Xcode*.app || true
+          LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n1)
+          if [ -n "$LATEST" ]; then
+            echo "Using $LATEST"
+            sudo xcode-select -s "$LATEST/Contents/Developer" || true
+          fi
+          xcodebuild -version || true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Prebuild iOS (generates ios/ from app.json)
+        run: npx expo prebuild -p ios --non-interactive
+
+      - name: CocoaPods install
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Archive (unsigned)
+        run: |
+          set -e
+          WS=$(ls -d ios/*.xcworkspace | head -n1)
+          echo "Workspace: $WS"
+          xcodebuild -workspace "$WS" -list
+          # auto-detect first scheme
+          SCHEME=$(xcodebuild -workspace "$WS" -list -json | python3 -c "import json,sys; d=json.load(sys.stdin); s=(d.get('workspace',{}).get('schemes') or d.get('project',{}).get('schemes') or []); print(s[0] if s else '')")
+          if [ -z "$SCHEME" ]; then
+            echo "Could not detect scheme, trying Panic"
+            SCHEME="Panic"
+          fi
+          echo "Scheme: $SCHEME"
+          xcodebuild \
+            -workspace "$WS" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/Panic.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP_PATH=$(find "$RUNNER_TEMP/Panic.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -n1)
+          echo "App: $APP_PATH"
+          test -n "$APP_PATH"
+          rm -rf Payload Panic-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r Panic-unsigned.ipa Payload
+          ls -lh Panic-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Panic-unsigned-ipa
+          path: Panic-unsigned.ipa
+          if-no-files-found: error
