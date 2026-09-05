@@ -45,7 +45,7 @@ jobs:
           cd ios
           pod install --repo-update
 
-      - name: Archive (unsigned)
+      - name: Build app (unsigned, no archive)
         run: |
           set -e
           WS=$(ls -d ios/*.xcworkspace | head -n1)
@@ -58,33 +58,27 @@ jobs:
             SCHEME="Panic"
           fi
           echo "Scheme: $SCHEME"
-          rm -rf build/Panic.xcarchive
+          rm -rf build/DerivedData
           xcodebuild \
             -workspace "$WS" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath "$GITHUB_WORKSPACE/build/Panic.xcarchive" \
-            archive \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" \
+            build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
-          echo "--- archive contents ---"
-          find "$GITHUB_WORKSPACE/build/Panic.xcarchive" -maxdepth 4 | head -n 40
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY=""
+          echo "--- products ---"
+          find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 2 | head -n 40
 
       - name: Package unsigned IPA
         run: |
           set -e
-          XCARCHIVE="$GITHUB_WORKSPACE/build/Panic.xcarchive"
           echo "--- searching for .app ---"
-          find "$XCARCHIVE" -maxdepth 5 -name "*.app" | head -n 10 || true
-          APP_PATH=$(find "$XCARCHIVE" -maxdepth 5 -name "*.app" | head -n1 || true)
-          # fallback: DerivedData product dir
-          if [ -z "$APP_PATH" ]; then
-            echo "--- fallback: DerivedData ---"
-            find ~/Library/Developer/Xcode/DerivedData -maxdepth 5 -name "*.app" -newer "$XCARCHIVE/Info.plist" 2>/dev/null | head -n 10 || true
-            APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 6 -path "*Release-iphoneos/*.app" 2>/dev/null | head -n1 || true)
-          fi
+          find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 3 -name "*.app" | head -n 10 || true
+          APP_PATH=$(find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 3 -name "*.app" | head -n1 || true)
           echo "App: $APP_PATH"
           test -n "$APP_PATH"
           test -d "$APP_PATH"
