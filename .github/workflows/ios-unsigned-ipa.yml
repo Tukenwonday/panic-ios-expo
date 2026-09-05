@@ -50,15 +50,32 @@ jobs:
           set -e
           WS=$(ls -d ios/*.xcworkspace | head -n1)
           echo "Workspace: $WS"
-          xcodebuild -workspace "$WS" -list
-          # auto-detect first scheme
-          SCHEME=$(xcodebuild -workspace "$WS" -list -json | python3 -c "import json,sys; d=json.load(sys.stdin); s=(d.get('workspace',{}).get('schemes') or d.get('project',{}).get('schemes') or []); print(s[0] if s else '')")
+          # App project = the .xcodeproj that is NOT Pods (Pods must never be the scheme)
+          APP_PROJ=$(ls -d ios/*.xcodeproj | grep -v -i pods | head -n1)
+          echo "App project: $APP_PROJ"
+          test -n "$APP_PROJ"
+          echo "--- shared schemes in app project ---"
+          ls "$APP_PROJ/xcshareddata/xcschemes/" || true
+          # Deterministic scheme: the app project's own shared scheme file.
+          # (xcodebuild -list order is NOT reliable: Pods schemes can come first,
+          #  and building one exits 0 without producing any .app.)
+          SCHEME=$(ls "$APP_PROJ/xcshareddata/xcschemes/" 2>/dev/null | head -n1 | sed 's/\.xcscheme$//')
           if [ -z "$SCHEME" ]; then
-            echo "Could not detect scheme, trying Panic"
-            SCHEME="Panic"
+            echo "No shared scheme file, falling back to workspace list (excluding Pods)"
+            SCHEME=$(xcodebuild -workspace "$WS" -list -json | python3 -c "import json,sys; d=json.load(sys.stdin); s=(d.get('workspace',{}).get('schemes') or d.get('project',{}).get('schemes') or []); s=[x for x in s if 'pod' not in x.lower()]; print(s[0] if s else '')")
+          fi
+          if [ -z "$SCHEME" ]; then
+            echo "ERROR: could not determine app scheme"
+            xcodebuild -workspace "$WS" -list || true
+            exit 1
+          fi
+          if echo "$SCHEME" | grep -qi pods; then
+            echo "ERROR: refusing to build Pods scheme ($SCHEME)"
+            exit 1
           fi
           echo "Scheme: $SCHEME"
-          rm -rf build/DerivedData
+          echo "$SCHEME" > "$GITHUB_WORKSPACE/scheme.txt"
+          rm -rf "$GITHUB_WORKSPACE/build/DerivedData"
           xcodebuild \
             -workspace "$WS" \
             -scheme "$SCHEME" \
@@ -70,15 +87,39 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             CODE_SIGN_IDENTITY=""
-          echo "--- products ---"
-          find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 2 | head -n 40
 
       - name: Package unsigned IPA
         run: |
           set -e
-          echo "--- searching for .app ---"
-          find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 3 -name "*.app" | head -n 10 || true
-          APP_PATH=$(find "$GITHUB_WORKSPACE/build/DerivedData/Build/Products" -maxdepth 3 -name "*.app" | head -n1 || true)
+          WS=$(ls -d ios/*.xcworkspace | head -n1)
+          SCHEME=$(cat "$GITHUB_WORKSPACE/scheme.txt")
+          echo "Workspace: $WS"
+          echo "Scheme: $SCHEME"
+          # Ask Xcode itself where the product is instead of guessing paths.
+          SETTINGS=$(xcodebuild \
+            -workspace "$WS" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" \
+            -showBuildSettings)
+          BUILT_DIR=$(echo "$SETTINGS" | grep -m1 " BUILT_PRODUCTS_DIR =" | sed 's/^.*= //')
+          FULL_PRODUCT=$(echo "$SETTINGS" | grep -m1 " FULL_PRODUCT_NAME =" | sed 's/^.*= //')
+          WRAPPER_NAME=$(echo "$SETTINGS" | grep -m1 " WRAPPER_NAME =" | sed 's/^.*= //')
+          echo "BUILT_PRODUCTS_DIR=$BUILT_DIR"
+          echo "FULL_PRODUCT_NAME=$FULL_PRODUCT"
+          echo "WRAPPER_NAME=$WRAPPER_NAME"
+          echo "--- products dir ---"
+          ls -la "$BUILT_DIR" || true
+          APP_PATH="$BUILT_DIR/$FULL_PRODUCT"
+          if [ ! -d "$APP_PATH" ] && [ -n "$WRAPPER_NAME" ]; then
+            APP_PATH="$BUILT_DIR/$WRAPPER_NAME"
+          fi
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Not at expected path, repo-wide search:"
+            find "$GITHUB_WORKSPACE/build" -name "*.app" | head -n 10 || true
+            APP_PATH=$(find "$GITHUB_WORKSPACE/build" -name "*.app" | head -n1 || true)
+          fi
           echo "App: $APP_PATH"
           test -n "$APP_PATH"
           test -d "$APP_PATH"
