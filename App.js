@@ -15,7 +15,11 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Haptics from 'expo-haptics';
-import { Audio } from 'expo-av';
+import {
+  useAudioStream,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+} from 'expo-audio';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   DEFAULT_IP,
@@ -129,7 +133,18 @@ export default function App() {
   const [micError, setMicError] = useState('');
   const wsRef = useRef(null);
   const isStreamingRef = useRef(false);
-  const currentRecordingRef = useRef(null);
+
+  /* expo-audio real-time PCM stream (16 kHz mono int16 → matches C++ miniaudio) */
+  const { stream: audioStream } = useAudioStream({
+    sampleRate: 16000,
+    channels: 1,
+    encoding: 'int16',
+    onBuffer: (buffer) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN && buffer.data?.byteLength > 0) {
+        wsRef.current.send(buffer.data);
+      }
+    },
+  });
 
   // Pulse animation for active streaming halo
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -256,8 +271,13 @@ export default function App() {
   /* ===================================================================
    * Wireless Microphone Streaming Logic (WebSocket to ws://<IP>:<PORT>/mic)
    * =================================================================== */
-  const stopMicStreaming = useCallback(async () => {
+  const stopMicStreaming = useCallback(() => {
     isStreamingRef.current = false;
+
+    // Stop native audio stream
+    try {
+      audioStream?.stop();
+    } catch {}
 
     // Close WebSocket
     if (wsRef.current) {
@@ -271,89 +291,12 @@ export default function App() {
       wsRef.current = null;
     }
 
-    // Stop and unload recording
-    if (currentRecordingRef.current) {
-      try {
-        await currentRecordingRef.current.stopAndUnloadAsync();
-      } catch {}
-      currentRecordingRef.current = null;
-    }
-
     setMicStatus('idle');
-  }, []);
+  }, [audioStream]);
 
-  const runStreamLoop = useCallback(async (ws) => {
-    const recordingOptions = {
-      isMeteringEnabled: true,
-      android: {
-        extension: '.m4a',
-        outputFormat: Audio.AndroidOutputFormat.MPEG_4,
-        audioEncoder: Audio.AndroidAudioEncoder.AAC,
-        sampleRate: 16000,
-        numberOfChannels: 1,
-        bitRate: 128000,
-      },
-      ios: {
-        extension: '.wav',
-        outputFormat: Audio.IOSOutputFormat.LINEARPCM,
-        audioQuality: Audio.IOSAudioQuality.HIGH,
-        sampleRate: 16000,
-        numberOfChannels: 1,
-        bitRate: 256000,
-        linearPCMBitDepth: 16,
-        linearPCMIsBigEndian: false,
-        linearPCMIsFloat: false,
-      },
-      web: {
-        mimeType: 'audio/webm',
-        bitsPerSecond: 128000,
-      },
-    };
-
-    while (isStreamingRef.current && ws?.readyState === WebSocket.OPEN) {
-      let rec = null;
-      try {
-        rec = new Audio.Recording();
-        currentRecordingRef.current = rec;
-        await rec.prepareToRecordAsync(recordingOptions);
-        await rec.startAsync();
-
-        // Capture continuous 250ms slice
-        await new Promise((r) => setTimeout(r, 250));
-
-        if (!isStreamingRef.current || ws?.readyState !== WebSocket.OPEN) {
-          try {
-            await rec.stopAndUnloadAsync();
-          } catch {}
-          break;
-        }
-
-        await rec.stopAndUnloadAsync();
-        const uri = rec.getURI();
-        currentRecordingRef.current = null;
-
-        if (uri && ws?.readyState === WebSocket.OPEN) {
-          const res = await fetch(uri);
-          const buf = await res.arrayBuffer();
-          if (ws?.readyState === WebSocket.OPEN && buf && buf.byteLength > 0) {
-            // Strip 44-byte WAV header on iOS to stream raw 16-bit PCM audio samples
-            const rawAudio = (Platform.OS === 'ios' && buf.byteLength > 44) ? buf.slice(44) : buf;
-            ws.send(rawAudio);
-          }
-        }
-      } catch (e) {
-        console.warn('Audio streaming slice error:', e);
-        if (rec) {
-          try {
-            await rec.stopAndUnloadAsync();
-          } catch {}
-        }
-        if (isStreamingRef.current) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-    }
-  }, []);
+  /* Audio streaming is now handled by the useAudioStream onBuffer callback.
+   * When streaming, each PCM buffer is sent directly over the WebSocket
+   * without writing to files. Much lower latency than the old approach. */
 
   const startMicStreaming = useCallback(async () => {
     setMicError('');
@@ -361,8 +304,8 @@ export default function App() {
 
     try {
       // 1. Request microphone permission
-      const perm = await Audio.requestPermissionsAsync();
-      if (perm.status !== 'granted') {
+      const perm = await requestRecordingPermissionsAsync();
+      if (!perm.granted) {
         setMicError('Microphone permission denied');
         setMicStatus('error');
         try {
@@ -372,12 +315,10 @@ export default function App() {
       }
 
       // 2. Configure audio mode for recording on iOS
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        shouldPlayInBackground: true,
       });
 
       // 3. Open WebSocket connection
@@ -386,13 +327,21 @@ export default function App() {
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         setMicStatus('streaming');
         isStreamingRef.current = true;
         try {
           Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         } catch {}
-        runStreamLoop(ws);
+        // Start the native real-time PCM audio stream
+        try {
+          await audioStream.start();
+        } catch (e) {
+          console.warn('AudioStream start error:', e);
+          setMicError('Failed to start audio capture');
+          setMicStatus('error');
+          stopMicStreaming();
+        }
       };
 
       ws.onerror = (err) => {
@@ -419,7 +368,7 @@ export default function App() {
       } catch {}
       stopMicStreaming();
     }
-  }, [ip, port, runStreamLoop, stopMicStreaming]);
+  }, [ip, port, audioStream, stopMicStreaming]);
 
   const onMicScreenTap = useCallback(async () => {
     if (micStatus === 'streaming' || micStatus === 'connecting') {
