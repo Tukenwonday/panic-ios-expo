@@ -7,6 +7,8 @@ name: iOS unsigned IPA (SideStore)
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
